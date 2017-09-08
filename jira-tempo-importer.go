@@ -1,42 +1,82 @@
 package main
 
 import (
-	"bytes"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/json"
+	"encoding/xml"
+	"flag"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
+
+	"bytes"
+	"io/ioutil"
+
+	"github.com/sirupsen/logrus"
 )
 
 func main() {
-	fmt.Printf("hello, world\n")
+	initFlags()
+	err := updateJira()
+	if err != nil {
+		panic(err)
+	}
+}
 
-	auth := base64.StdEncoding.EncodeToString([]byte(os.Getenv("USERNAME") + ":" + os.Getenv("PASSWORD")))
+var flagToken string
+var flagUrl string
+var flagUsername string
 
+func initFlags() {
+	flag.StringVar(&flagToken, "token", "", "Tempo access token")
+	flag.StringVar(&flagUrl, "url", "", "URL to access the jira server")
+	flag.StringVar(&flagUsername, "username", "", "User which logs should be updated")
+	flag.Parse()
+}
+
+func updateJira() error {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	client := &http.Client{Transport: tr}
 
 	date := time.Now().Add(-(7 * 24 * time.Hour))
-	url := fmt.Sprintf("https://jira.mcl.de/rest/tempo-timesheets/3/worklogs/?dateFrom=%4d-%02d-%02d&username=%s", date.Year(), date.Month(), date.Day(), os.Getenv("USERNAME"))
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Authorization", "Basic "+auth)
+	url := fmt.Sprintf(
+		"%s/plugins/servlet/tempo-getWorklog/?format=xml&tempoApiToken=%s&userName=%s&dateFrom=%4d-%02d-%02d",
+		flagUrl,
+		flagToken,
+		flagUsername,
+		date.Year(), date.Month(), date.Day(),
+	)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
 	res, err := client.Do(req)
 	if err != nil {
-		panic(err)
+		return err
+	}
+	defer res.Body.Close()
+
+	//b, err := ioutil.ReadAll(res.Body)
+	//if err != nil {
+	//	return err
+	//}
+	//logrus.Println(string(b))
+
+	var worklogs worklogsXML
+	err = xml.NewDecoder(res.Body).Decode(&worklogs)
+	if err != nil {
+		return err
 	}
 
-	var worklogs []worklog
-	json.NewDecoder(res.Body).Decode(&worklogs)
+	for _, v := range worklogs.Worklogs {
+		if v.BillingAttributes != "" {
+			continue
+		}
 
-	for i := range worklogs {
 		newTypeValue := ""
-		switch strings.ToLower(worklogs[i].Comment) {
+		switch strings.ToLower(v.WorkDescription) {
 
 		case "merge approval":
 			fallthrough
@@ -70,43 +110,47 @@ func main() {
 			newTypeValue = "development"
 		}
 
-		if len(worklogs[i].WorkAttributeValues) > 0 && (worklogs[i].WorkAttributeValues[0].Value == newTypeValue || worklogs[i].WorkAttributeValues[0].Value == "refinement") {
-			fmt.Printf("OK %s\n", worklogs[i].Comment)
-		} else {
-			fmt.Printf("NOT OK %s -> %s\n", worklogs[i].Comment, newTypeValue)
+		fmt.Printf("NOT OK %s -> %s\n", v.WorkDescription, newTypeValue)
 
-			newWorklog := worklogs[i]
-
-			newValues := make([]worklogAttributeValue, 1)
-			newValues[0] = worklogAttributeValue{
-				Value: newTypeValue,
-				WorkAttribute: worklogAttributeValueAttribute{
-					ID: 1,
+		updates := worklogUpdatesXML{
+			WorklogUpdates: []worklogUpdateXML{
+				{
+					ID:                v.ID,
+					BillingAttributes: fmt.Sprintf("type=%s", newTypeValue),
+					HashValue:         v.HashValue,
 				},
-				WorklogID: newWorklog.ID,
-			}
-
-			newWorklog.WorkAttributeValues = newValues
-
-			jsonString, err := json.Marshal(newWorklog)
-			if err == nil {
-				// fmt.Println(string(jsonString))
-				req, err = http.NewRequest("PUT", newWorklog.Self, bytes.NewBuffer(jsonString))
-				req.Header.Set("Authorization", "Basic "+auth)
-				req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-				if err == nil {
-					res, err = client.Do(req)
-					if err != nil {
-						fmt.Printf("PUT failed: %s\n", err)
-					} else if res.StatusCode != 200 {
-						fmt.Printf("PUT failed: Status code %d\n", res.StatusCode)
-					}
-				} else {
-					fmt.Printf("PUT prepare failed: %s\n", err)
-				}
-			} else {
-				fmt.Printf("JSON failed: %s\n", err)
-			}
+			},
 		}
+		changes, err := xml.Marshal(updates)
+		if err != nil {
+			return err
+		}
+		logrus.Println(string(changes))
+
+		url = fmt.Sprintf(
+			"%s/plugins/servlet/tempo-updateWorklog/?tempoApiToken=%s",
+			flagUrl,
+			flagToken,
+		)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(changes))
+		if err != nil {
+			return err
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+
+		logrus.Warnln(res.Status)
+
+		b, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			return err
+		}
+		logrus.Warnln(string(b))
+
+		res.Body.Close()
 	}
+
+	return nil
 }

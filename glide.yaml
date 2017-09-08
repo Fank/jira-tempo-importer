@@ -1,0 +1,4 @@
+package: github.com/fank/jira-tempo-importer
+import:
+- package: github.com/sirupsen/logrus
+  version: ^1.0.3
